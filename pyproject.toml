@@ -41,6 +41,8 @@ dependencies = [
     "mcp[cli]>=2.0.0,<3",
     "httpx>=0.27.0,<1.0.0",
     "pydantic>=2.0.0,<3.0.0",
+    "tzfpy==2.0.0",
+    "tzdata==2026.5",
 ]
 
 [project.optional-dependencies]

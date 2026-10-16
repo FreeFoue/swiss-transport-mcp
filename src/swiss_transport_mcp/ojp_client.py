@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .local_times import place_zones, enrich_event, enrich_leg, enrich_trip
+
 # OJP 2.0 XML namespaces
 OJP = "http://www.vdv.de/ojp"
 SIRI = "http://www.siri.org.uk/siri"
@@ -312,6 +314,7 @@ def parse_location_response(xml_text: str) -> list[dict[str, Any]]:
 
 def parse_stop_event_response(xml_text: str) -> list[dict[str, Any]]:
     root = ET.fromstring(xml_text)
+    zones = place_zones(root)
     events = []
 
     for result in _findall_iter(root, "StopEventResult"):
@@ -373,6 +376,7 @@ def parse_stop_event_response(xml_text: str) -> list[dict[str, Any]]:
                 pass
 
         if ev.get("line") or ev.get("destination"):
+            enrich_event(ev, call_at, zones)
             events.append(ev)
 
     return events
@@ -380,6 +384,7 @@ def parse_stop_event_response(xml_text: str) -> list[dict[str, Any]]:
 
 def parse_trip_response(xml_text: str) -> list[dict[str, Any]]:
     root = ET.fromstring(xml_text)
+    zones = place_zones(root)
     trips = []
 
     for trip_result in _findall_iter(root, "TripResult"):
@@ -415,9 +420,11 @@ def parse_trip_response(xml_text: str) -> list[dict[str, Any]]:
         for leg_el in _findall_iter(src, "Leg"):
             leg_data = _parse_leg(leg_el)
             if leg_data:
+                enrich_leg(leg_data, leg_el, zones)
                 trip["legs"].append(leg_data)
 
         if trip.get("legs"):
+            enrich_trip(trip)
             trips.append(trip)
 
     return trips
