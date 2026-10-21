@@ -15,6 +15,7 @@ services:
       MCP_HOST: 0.0.0.0          # inside the container, bind all interfaces
       MCP_PORT: "8000"
       LOG_LEVEL: INFO
+      SIRI_SX_STATE_DIR: /var/lib/ridolo
       # Browser origins allowed to call the HTTP transport (comma-separated).
       MCP_CORS_ORIGINS: ${MCP_CORS_ORIGINS:-https://claude.ai}
       # API keys – supply via your shell / .env (never commit them).
@@ -23,11 +24,13 @@ services:
       OCCUPANCY_API_KEY: ${OCCUPANCY_API_KEY:-}
       FORMATION_API_KEY: ${FORMATION_API_KEY:-}
       OJP_FARE_API_KEY: ${OJP_FARE_API_KEY:-}
+    volumes:
+      - siri-state:/var/lib/ridolo
     read_only: true
     security_opt:
       - no-new-privileges:true
     # SCALE-006: cap memory, CPU and file descriptors per container.
-    mem_limit: 256m
+    mem_limit: 1g
     cpus: 0.50
     pids_limit: 128
     ulimits:
@@ -35,3 +38,6 @@ services:
         soft: 1024
         hard: 2048
     restart: unless-stopped
+
+volumes:
+  siri-state:

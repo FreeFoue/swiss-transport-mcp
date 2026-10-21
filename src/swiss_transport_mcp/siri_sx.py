@@ -1,236 +1,415 @@
-"""
-SIRI-SX Störungsmeldungen – Das Frühwarnsystem deines MCP-Servers.
+"""Bounded SIRI-SX parsing and persistent shared snapshot/quota handling.
 
-Metapher: Stell dir SIRI-SX vor wie die Durchsagen am Bahnhof.
-Ohne sie weiss Claude zwar den Fahrplan, aber nicht, dass
-der Zug gerade 20 Minuten Verspätung hat oder ausfällt.
-
-API-Details:
-- Endpoint: GET https://api.opentransportdata.swiss/la/siri-sx
-- Format: XML (SIRI-SX / VDV 736 Standard)
-- Auth: Bearer Token im Header
-- Inhalt: Alle aktiven Störungen im Schweizer ÖV
-- Sprachen: DE, FR, IT, EN
-- Rate Limit: 2 Abfragen/Minute (Sliding Window)
-
-Die XML-Antwort ist riesig (alle Störungen der Schweiz!).
-Deshalb parsen wir gezielt und liefern nur relevante Infos ans LLM.
+No passenger queries or credentials are written to disk. A snapshot is textual
+search evidence, not proof that an entire itinerary is disruption-free.
 """
 
+import asyncio
+import fcntl
+import json
+import os
+import re
+import time
+import unicodedata
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 
-from .api_infrastructure import APIError, TransportAPIClient
+import httpx
 
-# SIRI-SX Namespaces – die XML-Struktur nutzt mehrere Namensräume
-NS = {
-    "siri": "http://www.siri.org.uk/siri",
-}
+from .api_infrastructure import TransportAPIClient
+from .net_security import resolve_ssl_verify, validate_egress_url
+
+TTL = 35 * 60
+MAX_BYTES = 128 * 1024 * 1024
+MAX_ALERTS = 20000
+MAX_ELEMENT_BYTES = 2 * 1024 * 1024
 
 
-async def get_disruptions(
-    client: TransportAPIClient,
-    filter_text: str | None = None,
-    language: str = "DE",
-    max_results: int = 20,
-) -> str:
-    """
-    Holt aktuelle Störungsmeldungen aus SIRI-SX.
+def name(tag):
+    return tag.rsplit("}", 1)[-1]
 
-    Args:
-        client: Der konfigurierte API-Client
-        filter_text: Optionaler Suchbegriff (z.B. "Zürich", "S-Bahn", "IC 1")
-        language: Sprache der Meldungen (DE, FR, IT, EN)
-        max_results: Maximale Anzahl Ergebnisse (verhindert Kontext-Overflow)
 
-    Returns:
-        Formatierter Text mit allen relevanten Störungen.
+def iso(value):
+    return datetime.fromtimestamp(value, UTC).isoformat()
 
-    Warum Text statt JSON? Weil ein LLM natürlichen Text besser versteht
-    als verschachtelte JSON-Strukturen. Das ist der Trick:
-    Wir wandeln maschinenlesbare Daten in menschenlesbaren Kontext um.
-    """
+
+def parse_date(value):
     try:
-        xml_text = await client.get("siri_sx")
-    except APIError as e:
-        return f"⚠️ Störungsmeldungen konnten nicht abgerufen werden: {e}"
-
-    return _parse_siri_sx(xml_text, filter_text, language, max_results)
-
-
-def _parse_siri_sx(
-    xml_text: str,
-    filter_text: str | None,
-    language: str,
-    max_results: int,
-) -> str:
-    """
-    Parst die SIRI-SX XML-Antwort und extrahiert strukturierte Störungsmeldungen.
-
-    Die XML-Struktur ist:
-    Siri > ServiceDelivery > SituationExchangeDelivery > Situations
-    > PtSituationElement (eine pro Störung)
-
-    Jedes PtSituationElement enthält:
-    - CreationTime: Wann wurde die Störung erstellt?
-    - ValidityPeriod: Von wann bis wann gilt sie?
-    - Severity: Wie schwerwiegend? (slight, normal, severe, noImpact)
-    - Summary: Kurztitel (mehrsprachig)
-    - Description: Detailtext (mehrsprachig)
-    - PublishingActions: Anzeigeaktionen mit passengerInformation
-    """
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return "⚠️ SIRI-SX Antwort konnte nicht geparst werden (ungültiges XML)."
-
-    # Situationen finden – mit und ohne Namespace
-    situations = root.findall(".//siri:PtSituationElement", NS)
-    if not situations:
-        # Fallback ohne Namespace (manche Endpoints liefern ohne Prefix)
-        situations = root.findall(".//{http://www.siri.org.uk/siri}PtSituationElement")
-    if not situations:
-        # Noch ein Fallback: direkt suchen
-        situations = root.findall(".//PtSituationElement")
-
-    if not situations:
-        return "✅ Aktuell keine Störungsmeldungen im Schweizer ÖV."
-
-    disruptions = []
-    lang_tag = language.lower()  # "de", "fr", "it", "en"
-
-    for sit in situations:
-        disruption = _extract_disruption(sit, lang_tag)
-        if disruption is None:
-            continue
-
-        # Textfilter anwenden
-        if filter_text:
-            search = filter_text.lower()
-            searchable = f"{disruption['title']} {disruption['description']} {disruption['affected']}".lower()
-            if search not in searchable:
-                continue
-
-        disruptions.append(disruption)
-
-    if not disruptions:
-        if filter_text:
-            return f"✅ Keine Störungen gefunden, die '{filter_text}' betreffen."
-        return "✅ Aktuell keine Störungsmeldungen im Schweizer ÖV."
-
-    # Nach Schweregrad sortieren: severe > normal > slight
-    severity_order = {"severe": 0, "normal": 1, "slight": 2, "noImpact": 3, "unknown": 4}
-    disruptions.sort(key=lambda d: severity_order.get(d["severity"], 4))
-
-    # Auf max_results begrenzen
-    disruptions = disruptions[:max_results]
-
-    # Formatieren
-    lines = [f"🚨 {len(disruptions)} aktive Störung(en) im Schweizer ÖV:\n"]
-    for i, d in enumerate(disruptions, 1):
-        severity_icon = {"severe": "🔴", "normal": "🟡", "slight": "🟢", "noImpact": "⚪"}.get(
-            d["severity"], "⚪"
-        )
-        lines.append(f"--- Störung {i} ---")
-        lines.append(f"{severity_icon} Schweregrad: {d['severity']}")
-        lines.append(f"📋 {d['title']}")
-        if d["description"]:
-            # Beschreibung kürzen, wenn zu lang (LLM-Kontext schonen)
-            desc = d["description"][:500]
-            if len(d["description"]) > 500:
-                desc += "... (gekürzt)"
-            lines.append(f"📝 {desc}")
-        if d["affected"]:
-            lines.append(f"🚆 Betrifft: {d['affected']}")
-        if d["valid_from"] or d["valid_to"]:
-            period = f"⏰ Gültig: {d['valid_from'] or '?'} bis {d['valid_to'] or 'unbekannt'}"
-            lines.append(period)
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def _extract_disruption(element: ET.Element, lang: str) -> dict | None:
-    """Extrahiert eine einzelne Störung aus einem PtSituationElement."""
-
-    def find_text(parent, tag, ns=NS):
-        """Findet Text in einem Element, mit mehreren Fallback-Strategien."""
-        # Mit Namespace
-        el = parent.find(f"siri:{tag}", ns)
-        if el is not None and el.text:
-            return el.text.strip()
-        # Ohne Namespace
-        el = parent.find(tag)
-        if el is not None and el.text:
-            return el.text.strip()
-        # Mit vollem Namespace
-        el = parent.find(f"{{http://www.siri.org.uk/siri}}{tag}")
-        if el is not None and el.text:
-            return el.text.strip()
-        return ""
-
-    def find_multilang(parent, tag):
-        """
-        Findet mehrsprachigen Text.
-        SIRI-SX hat oft: <Summary xml:lang="de">Text</Summary>
-        oder <Summary><DefaultedTextStructure xml:lang="de">Text</...></Summary>
-        """
-        # Direkter Ansatz: Tag mit xml:lang Attribut
-        for el in parent.iter():
-            if el.tag.endswith(tag) or tag in el.tag:
-                if el.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower() == lang:
-                    return el.text.strip() if el.text else ""
-        # Fallback: Erster Text, den wir finden
-        return find_text(parent, tag)
-
-    # Hauptinformationen extrahieren
-    title = find_multilang(element, "Summary") or find_text(element, "Summary")
-    description = find_multilang(element, "Description") or find_text(element, "Description")
-    severity = find_text(element, "Severity") or "unknown"
-
-    # Zeitraum
-    valid_from = find_text(element, "StartTime")
-    valid_to = find_text(element, "EndTime")
-
-    # Betroffene Linien/Strecken aus PublishingActions extrahieren
-    affected_parts = []
-
-    # PublishingActions > PassengerInformationAction > TextualContent
-    for action in element.iter():
-        tag_name = action.tag.split("}")[-1] if "}" in action.tag else action.tag
-        if tag_name == "PublishingAction":
-            for child in action.iter():
-                child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                if child_tag in ("LineRef", "StopPointRef", "OperatorRef"):
-                    if child.text:
-                        affected_parts.append(child.text.strip())
-
-    # Auch aus Affects-Block
-    for affects in element.iter():
-        tag_name = affects.tag.split("}")[-1] if "}" in affects.tag else affects.tag
-        if tag_name in ("LineRef", "StopPointRef", "PublishedLineName"):
-            if affects.text:
-                affected_parts.append(affects.text.strip())
-
-    if not title and not description:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.timestamp() if dt.utcoffset() is not None else None
+    except (ValueError, TypeError, AttributeError):
         return None
 
+
+def normalize(value):
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", value.casefold()) if not unicodedata.combining(c)
+    )
+
+
+def extract(element):
+    def texts(tag):
+        return [" ".join(e.itertext()).strip()[:4000] for e in element.iter() if name(e.tag) == tag]
+
+    localized = {}
+    for tag in ("Summary", "Description"):
+        values = {}
+        for e in element.iter():
+            if name(e.tag) != tag:
+                continue
+            lang = e.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
+            for child in e.iter():
+                lang = lang or child.get("{http://www.w3.org/XML/1998/namespace}lang", "").lower()
+            text = " ".join(" ".join(e.itertext()).split())[:4000]
+            if text:
+                values.setdefault(lang or "und", text)
+        localized[tag.lower()] = values
+    periods = []
+    for e in element.iter():
+        if name(e.tag) == "ValidityPeriod":
+            fields = {name(c.tag): (c.text or "").strip() for c in e}
+            periods.append({"start": fields.get("StartTime"), "end": fields.get("EndTime")})
+    affected = sorted(
+        set(
+            v
+            for tag in (
+                "LineRef",
+                "StopPointRef",
+                "StopPlaceRef",
+                "PublishedLineName",
+                "StopPointName",
+                "OperatorRef",
+            )
+            for v in texts(tag)
+            if v
+        )
+    )[:200]
     return {
-        "title": title,
-        "description": description,
-        "severity": severity.lower(),
-        "valid_from": _format_datetime(valid_from),
-        "valid_to": _format_datetime(valid_to),
-        "affected": ", ".join(set(affected_parts)) if affected_parts else "",
+        "truncated_fields": sorted(
+            k.removeprefix("truncated_") for k in element.attrib if k.startswith("truncated_")
+        ),
+        "id": next(iter(texts("SituationNumber")), ""),
+        **localized,
+        "affected": affected,
+        "periods": periods,
+        "severity": next(iter(texts("Severity")), "unknown"),
+        "progress": next(iter(texts("Progress")), "unknown"),
     }
 
 
-def _format_datetime(dt_str: str) -> str:
-    """Formatiert ISO-Datetime in lesbares Schweizer Format."""
-    if not dt_str:
-        return ""
+def parse_chunks(chunks):
+    """Retain only bounded passenger fields, never a whole situation tree."""
+    parser = ET.XMLPullParser(events=("start", "end"))
+    stack, alerts = [], []
+    total = since_release = 0
+    delivery = False
+    situation = capture = None
+    counts = {}
+    tail = b""
+    wanted = {
+        "Summary",
+        "Description",
+        "ValidityPeriod",
+        "SituationNumber",
+        "Severity",
+        "Progress",
+        "LineRef",
+        "StopPointRef",
+        "StopPlaceRef",
+        "PublishedLineName",
+        "StopPointName",
+        "OperatorRef",
+    }
+    for chunk in chunks:
+        total += len(chunk)
+        since_release += len(chunk)
+        if total > MAX_BYTES:
+            raise ValueError("feed_size_limit")
+        if since_release > MAX_ELEMENT_BYTES:
+            raise ValueError("element_size_limit")
+        scan = tail + chunk
+        if b"<!DOCTYPE" in scan.upper() or b"<!ENTITY" in scan.upper() or b"\x00" in chunk:
+            raise ValueError("unsupported_xml")
+        tail = scan[-16:]
+        parser.feed(chunk)
+        for event, e in parser.read_events():
+            tag = name(e.tag)
+            if event == "start":
+                stack.append(e)
+                if tag == "SituationExchangeDelivery":
+                    delivery = True
+                if tag == "PtSituationElement":
+                    if situation is not None:
+                        raise ValueError("unrecognized_feed")
+                    situation = ET.Element("PtSituationElement")
+                    counts = {}
+                elif situation is not None and capture is None and tag in wanted:
+                    capture = e
+                continue
+            if tag == "ErrorCondition" or (
+                tag == "Status" and (e.text or "").strip().lower() == "false"
+            ):
+                raise ValueError("upstream_error")
+            if capture is e:
+                # Collapse each field now, including nested multilingual text.
+                # Independent budgets preserve text even after thousands of refs.
+                budget = 32 if tag in ("Summary", "Description", "ValidityPeriod") else 200
+                counts[tag] = counts.get(tag, 0) + 1
+                keep = counts[tag] <= budget
+                if not keep:
+                    situation.set("truncated_" + tag, "true")
+                field = ET.SubElement(situation, tag) if keep else ET.Element(tag)
+                if tag == "ValidityPeriod":
+                    for child in e:
+                        if name(child.tag) in ("StartTime", "EndTime"):
+                            ET.SubElement(field, name(child.tag)).text = (child.text or "")[:100]
+                else:
+                    field.text = " ".join(" ".join(e.itertext()).split())[:4000]
+                    for child in e.iter():
+                        lang = child.get("{http://www.w3.org/XML/1998/namespace}lang")
+                        if lang:
+                            field.set("{http://www.w3.org/XML/1998/namespace}lang", lang)
+                            break
+                capture = None
+            if tag == "PtSituationElement":
+                alerts.append(extract(situation))
+                if len(alerts) > MAX_ALERTS:
+                    raise ValueError("alert_count_limit")
+                situation = None
+            if capture is None:
+                if len(stack) > 1:
+                    stack[-2].remove(e)
+                e.clear()
+                since_release = 0
+            stack.pop()
+    parser.close()
+    if not delivery:
+        raise ValueError("unrecognized_feed")
+    return alerts
+
+
+def read_state(path):
+    if not path.exists():
+        return {"attempts": [], "snapshot": None, "retry_after": 0}
+    data = json.loads(path.read_text())
+    if not isinstance(data.get("attempts"), list) or "snapshot" not in data:
+        raise ValueError("invalid_state")
+    return data
+
+
+def save_state(path, state):
+    temp = path.with_suffix(".tmp")
+    with temp.open("w") as f:
+        os.chmod(temp, 0o600)
+        json.dump(state, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+    fd = os.open(path.parent, os.O_RDONLY)
     try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%d.%m.%Y %H:%M")
-    except (ValueError, TypeError):
-        return dt_str
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def refresh(config, directory):
+    """Serialize across processes; reserve budget durably before any network call."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / "siri.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "status": "busy",
+                "message": "Refresh already in progress; no conclusion possible.",
+            }
+        path = directory / "siri-state.json"
+        state = read_state(path)  # Corrupt state fails closed: never reset quota silently.
+        now = time.time()
+        snapshot = state["snapshot"]
+        if snapshot and 0 <= now - snapshot["fetched_at"] < TTL:
+            return {"status": "ok", "snapshot": snapshot, "cached": True}
+        attempts = [t for t in state["attempts"] if t > now - 86400]
+        state["attempts"] = attempts
+        if (
+            len(attempts) >= 48
+            or sum(t > now - 3600 for t in attempts) >= 10
+            or now < state.get("retry_after", 0)
+        ):
+            return {"status": "rate_limited", "message": "No fresh verification available."}
+        attempts.append(now)
+        save_state(path, state)
+        try:
+            with httpx.Client(
+                timeout=30, follow_redirects=True, verify=resolve_ssl_verify()
+            ) as http:
+                with http.stream(
+                    "GET",
+                    validate_egress_url(config.base_url),
+                    headers={
+                        "Authorization": f"Bearer {config.api_key}",
+                        "Accept": "application/xml",
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    deadline = time.monotonic() + 60
+
+                    def chunks():
+                        for chunk in response.iter_bytes(chunk_size=16384):
+                            if time.monotonic() > deadline:
+                                raise TimeoutError()
+                            yield chunk
+
+                    alerts = parse_chunks(chunks())
+            state["snapshot"] = {"fetched_at": time.time(), "alerts": alerts}
+            state["retry_after"] = 0
+            save_state(path, state)
+            return {"status": "ok", "snapshot": state["snapshot"], "cached": False}
+        except (httpx.HTTPError, ValueError, ET.ParseError, TimeoutError) as exc:
+            status = "unavailable"
+            if isinstance(exc, httpx.HTTPStatusError):
+                code = exc.response.status_code
+                status = "authentication_error" if code in (401, 403) else "upstream_error"
+                if code == 429:
+                    status = "rate_limited"
+            elif isinstance(exc, (ValueError, ET.ParseError)):
+                status = "invalid_feed"
+            # Only fixed diagnostic codes, never response bodies or signed URLs.
+            diagnostic = {"code": "request_failed"}
+            if isinstance(exc, ET.ParseError):
+                diagnostic = {"code": "xml_parse_error", "position": exc.position}
+            elif isinstance(exc, ValueError):
+                known = {
+                    "feed_size_limit",
+                    "element_size_limit",
+                    "unsupported_xml",
+                    "upstream_error",
+                    "alert_count_limit",
+                    "alert_fields_limit",
+                    "unrecognized_feed",
+                }
+                diagnostic = {"code": str(exc) if str(exc) in known else "invalid_value"}
+            elif isinstance(exc, httpx.HTTPStatusError):
+                diagnostic = {"code": "http_error", "http_status": exc.response.status_code}
+            elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+                diagnostic = {"code": "download_timeout"}
+            # No automatic retries; every failed download still consumes budget.
+            state["retry_after"] = time.time() + (3600 if status == "rate_limited" else 300)
+            save_state(path, state)
+            return {
+                "status": status,
+                "message": "Verification failed. Do not infer no disruptions.",
+                "diagnostic": diagnostic,
+            }
+
+
+def period_status(alert, now):
+    if "ValidityPeriod" in alert.get("truncated_fields", []):
+        return "unknown"
+    if alert["progress"].lower() == "closed":
+        return "closed"
+    states = []
+    for period in alert["periods"]:
+        start, end = parse_date(period["start"]), parse_date(period["end"])
+        if start is None or (period["end"] and end is None) or (end is not None and end < start):
+            states.append("unknown")
+        elif start > now:
+            states.append("planned")
+        elif end is not None and end <= now:
+            states.append("expired")
+        else:
+            states.append("active")
+    for status in ("active", "unknown", "planned", "expired"):
+        if status in states:
+            return status
+    return "unknown"
+
+
+def render(result, query, language, limit):
+    if result["status"] != "ok":
+        return json.dumps(result, ensure_ascii=False)
+    snapshot = result["snapshot"]
+    now = time.time()
+    terms = re.findall(r"\w+", normalize(query or ""))
+    selected = []
+    unreadable = 0
+    incomplete = sum(bool(a.get("truncated_fields")) for a in snapshot["alerts"])
+    for alert in snapshot["alerts"]:
+        if not alert["summary"] and not alert["description"]:
+            unreadable += 1
+            continue
+        searchable = normalize(
+            " ".join(
+                [*alert["summary"].values(), *alert["description"].values(), *alert["affected"]]
+            )
+        )
+        if terms and not any(
+            re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", searchable) for t in terms
+        ):
+            continue
+        validity = period_status(alert, now)
+        if validity in ("expired", "closed"):
+            continue
+
+        def pick(values):
+            key = language.lower() if language.lower() in values else next(iter(values), None)
+            return {"text": values.get(key, ""), "language": key}
+
+        selected.append(
+            {
+                **alert,
+                "summary": pick(alert["summary"]),
+                "description": pick(alert["description"]),
+                "validity": validity,
+            }
+        )
+    severity = {"severe": 0, "normal": 1, "slight": 2}
+    selected.sort(key=lambda x: (x["validity"] != "active", severity.get(x["severity"], 3)))
+    limit = max(1, min(int(limit), 50))
+    return json.dumps(
+        {
+            "status": "ok",
+            "source": "SIRI-SX",
+            "fetched_at": iso(snapshot["fetched_at"]),
+            "age_seconds": max(0, int(now - snapshot["fetched_at"])),
+            "cache_ttl_seconds": TTL,
+            "cached": result["cached"],
+            "query": query,
+            "match_mode": "any_term_text_search",
+            "scope": "text_matches_not_verified_route_coverage",
+            "matched_count": len(selected),
+            "truncated": len(selected) > limit,
+            "unreadable_alerts": unreadable,
+            "incomplete_alerts_in_snapshot": incomplete,
+            "alerts": selected[:limit],
+            "interpretation": "No matches is NOT proof of no disruptions on a route. "
+            "Truncated fields mean incomplete details and potentially missed text matches. "
+            "Planned/unknown validity alerts are NOT confirmed active. "
+            "Report snapshot age. Times retain UTC offsets; do not guess local times.",
+        },
+        ensure_ascii=False,
+    )
+
+
+async def get_disruptions(
+    client: TransportAPIClient, filter_text=None, language="DE", max_results=20
+):
+    config = client._configs.get("siri_sx")
+    if not config:
+        return json.dumps(
+            {"status": "not_configured", "message": "Disruption verification unavailable."}
+        )
+    if not hasattr(client, "_siri_lock"):
+        client._siri_lock = asyncio.Lock()
+    async with client._siri_lock:
+        try:
+            directory = Path(
+                os.environ.get("SIRI_SX_STATE_DIR", "~/.local/state/ridolo")
+            ).expanduser()
+            result = await asyncio.to_thread(refresh, config, directory)
+            return render(result, filter_text, language, max_results)
+        except (OSError, ValueError, TypeError, KeyError):
+            return json.dumps(
+                {"status": "state_error", "message": "Cannot verify disruptions safely."}
+            )

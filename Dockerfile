@@ -27,7 +27,9 @@ RUN pip install --upgrade pip && pip install .
 FROM python:3.14-slim AS runtime
 
 # SEC-007: run as an unprivileged user with a minimal image surface.
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /var/lib/ridolo \
+    && chown appuser:appuser /var/lib/ridolo
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

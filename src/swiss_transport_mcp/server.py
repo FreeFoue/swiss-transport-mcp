@@ -254,6 +254,10 @@ class DeparturesInput(BaseModel):
         default=None,
         description="Departure time in ISO 8601 (e.g., '2026-03-01T08:00:00Z'). Defaults to now.",
     )
+    time_zone: str = Field(
+        default="Europe/Zurich",
+        description="IANA timezone for a time without offset. Swiss service default: Europe/Zurich. For other locations specify their timezone explicitly, not the passenger timezone. Explicit offsets/Z take precedence.",
+    )
     limit: int = Field(
         default=10,
         description="Number of departures to show (1–30)",
@@ -292,6 +296,10 @@ class TripPlanInput(BaseModel):
     time: str | None = Field(
         default=None,
         description="Departure time in ISO 8601. Defaults to now.",
+    )
+    time_zone: str = Field(
+        default="Europe/Zurich",
+        description="IANA timezone for a time without offset. Swiss service default: Europe/Zurich. For other locations specify their timezone explicitly, not the passenger timezone. Explicit offsets/Z take precedence.",
     )
     limit: int = Field(
         default=5,
@@ -633,6 +641,7 @@ async def transport_departures(params: DeparturesInput, ctx: Context) -> Departu
             stop_ref=stop_id,
             stop_name=params.stop_name or resolved_name,
             dep_arr_time=params.time,
+            time_zone=params.time_zone,
             limit=params.limit,
             event_type=params.event_type,
         )
@@ -713,6 +722,7 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
             origin_name=origin_name,
             destination_name=destination_name,
             dep_time=params.time,
+            time_zone=params.time_zone,
             limit=params.limit,
         )
         xml_response = await api_client.ojp_request(xml_request)
@@ -898,27 +908,20 @@ async def get_transport_disruptions(
     language: str = "DE",
     max_results: int = 15,
 ) -> str:
-    """Aktuelle Störungsmeldungen im Schweizer öffentlichen Verkehr abrufen.
+    """Search SIRI-SX disruption reports (shared snapshot, up to 35 minutes old).
 
-    Liefert Informationen zu Zugausfällen, Verspätungen, Gleisänderungen,
-    Streckensperrungen und anderen Betriebsstörungen.
-
-    Args:
-        filter_text: Suchbegriff zum Filtern (z.B. "Zürich", "S-Bahn", "IC 1",
-                     "Bern-Thun"). Leer = alle Störungen.
-        language: Sprache der Meldungen. DE (Deutsch), FR (Französisch),
-                  IT (Italienisch), EN (Englisch).
-        max_results: Maximale Anzahl Ergebnisse (1-50). Standard: 15.
-
-    Beispiele:
-        - Alle aktuellen Störungen: get_transport_disruptions()
-        - Störungen in Zürich: get_transport_disruptions(filter_text="Zürich")
-        - S-Bahn Störungen: get_transport_disruptions(filter_text="S-Bahn")
-        - Strecke prüfen: get_transport_disruptions(filter_text="Bern")
+    Call this tool for disruption questions. Check status before interpreting alerts.
+    An error means verification unavailable, never "no disruptions".
+    filter_text: place or line terms; ANY term matches, accent-insensitive.
+    This is textual matching, NOT verified route coverage: zero matches never
+    proves that a route has no disruptions. Check each alert's affected area and
+    validity. Planned or unknown validity is not confirmed active.
+    language: DE, FR, IT or EN; fallback text is labelled with its language.
+    max_results: 1-50 (default 15). Explain truncation and snapshot age.
     """
-    error = _check_api("SIRI-SX Störungsmeldungen", "SIRI_SX_API_KEY")
+    error = _check_api("SIRI-SX", "SIRI_SX_API_KEY")
     if error:
-        return error
+        return '{"status":"not_configured","message":"Disruption verification unavailable."}'
 
     client = _get_ext_client()
     return await get_disruptions(
