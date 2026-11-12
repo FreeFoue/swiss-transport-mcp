@@ -44,6 +44,7 @@ from .net_security import resolve_ssl_verify
 from .occupancy import get_occupancy_for_route, get_occupancy_forecast
 from .ojp_fare import get_fare_info
 from .siri_sx import get_disruptions
+from .request_times import validate_journey_time, PastJourneyTime
 from .tool_integrity import check_tools_against_manifest
 from .tracing import configure_tracing
 
@@ -254,6 +255,10 @@ class DeparturesInput(BaseModel):
         default=None,
         description="Departure time in ISO 8601 (e.g., '2026-03-01T08:00:00Z'). Defaults to now.",
     )
+    time_zone: str = Field(
+        default="Europe/Zurich",
+        description="IANA timezone for a time without offset. Swiss service default: Europe/Zurich. For other locations specify their timezone explicitly, not the passenger timezone. Explicit offsets/Z take precedence.",
+    )
     limit: int = Field(
         default=10,
         description="Number of departures to show (1–30)",
@@ -291,7 +296,16 @@ class TripPlanInput(BaseModel):
     )
     time: str | None = Field(
         default=None,
-        description="Departure time in ISO 8601. Defaults to now.",
+        description="ISO 8601 date/time for time_type. Naive times use time_zone. Departure defaults to now; arrival requires an explicit time. Past journeys are rejected.",
+    )
+    time_type: str = Field(
+        default="departure",
+        pattern=r"^(departure|arrival)$",
+        description="Use arrival for arrive by/arriver à/Ankunft/arrivare entro/llegar antes de. Otherwise departure.",
+    )
+    time_zone: str = Field(
+        default="Europe/Zurich",
+        description="IANA timezone for a time without offset. Swiss service default: Europe/Zurich. For other locations specify their timezone explicitly, not the passenger timezone. Explicit offsets/Z take precedence.",
     )
     limit: int = Field(
         default=5,
@@ -378,6 +392,8 @@ class DeparturesResult(BaseModel):
 
 class TripPlanResult(BaseModel):
     """Result of transport_trip_plan."""
+
+    status: str = "ok"
 
     origin: str | None = None
     destination: str | None = None
@@ -633,6 +649,7 @@ async def transport_departures(params: DeparturesInput, ctx: Context) -> Departu
             stop_ref=stop_id,
             stop_name=params.stop_name or resolved_name,
             dep_arr_time=params.time,
+            time_zone=params.time_zone,
             limit=params.limit,
             event_type=params.event_type,
         )
@@ -704,6 +721,14 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
         total duration, number of transfers, and transport modes used.
     """
     try:
+        if params.time_type == "arrival" and params.time is None:
+            return TripPlanResult(status="invalid_time", message="Arrival search requires a date and time. Ask the user once; do not substitute departure time.")
+        try:
+            normalized_time = validate_journey_time(params.time, params.time_zone)
+        except PastJourneyTime as exc:
+            return TripPlanResult(status="past_time", message=str(exc))
+        except ValueError as exc:
+            return TripPlanResult(status="invalid_time", message=str(exc))
         await ctx.info(f"Planning trip {params.origin} → {params.destination}")
         origin_id, origin_name = await _resolve_place(params.origin)
         destination_id, destination_name = await _resolve_place(params.destination)
@@ -712,7 +737,9 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
             destination_ref=destination_id,
             origin_name=origin_name,
             destination_name=destination_name,
-            dep_time=params.time,
+            dep_time=normalized_time,
+            time_type=params.time_type,
+            time_zone=params.time_zone,
             limit=params.limit,
         )
         xml_response = await api_client.ojp_request(xml_request)
@@ -722,6 +749,7 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
             return TripPlanResult(
                 origin=params.origin,
                 destination=params.destination,
+                status="upstream_error",
                 message=f"OJP Error: {error}",
             )
 
@@ -729,11 +757,13 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
 
         if not trips:
             return TripPlanResult(
+                status="no_results",
                 origin=params.origin,
                 destination=params.destination,
                 message=(
                     f"No trips found from '{params.origin}' to '{params.destination}'. "
-                    "Try using stop IDs instead of names."
+                    "Check the requested date/year, arrival versus departure, and exact destination. "
+                    "Do not repeat this search with cosmetic name changes or substitute another stop without confirmation."
                 ),
             )
 
@@ -749,6 +779,7 @@ async def transport_trip_plan(params: TripPlanInput, ctx: Context) -> TripPlanRe
         return TripPlanResult(
             origin=params.origin,
             destination=params.destination,
+            status="error",
             message=api_client.handle_api_error(e),
         )
 
@@ -898,27 +929,20 @@ async def get_transport_disruptions(
     language: str = "DE",
     max_results: int = 15,
 ) -> str:
-    """Aktuelle Störungsmeldungen im Schweizer öffentlichen Verkehr abrufen.
+    """Search SIRI-SX disruption reports (shared snapshot, up to 35 minutes old).
 
-    Liefert Informationen zu Zugausfällen, Verspätungen, Gleisänderungen,
-    Streckensperrungen und anderen Betriebsstörungen.
-
-    Args:
-        filter_text: Suchbegriff zum Filtern (z.B. "Zürich", "S-Bahn", "IC 1",
-                     "Bern-Thun"). Leer = alle Störungen.
-        language: Sprache der Meldungen. DE (Deutsch), FR (Französisch),
-                  IT (Italienisch), EN (Englisch).
-        max_results: Maximale Anzahl Ergebnisse (1-50). Standard: 15.
-
-    Beispiele:
-        - Alle aktuellen Störungen: get_transport_disruptions()
-        - Störungen in Zürich: get_transport_disruptions(filter_text="Zürich")
-        - S-Bahn Störungen: get_transport_disruptions(filter_text="S-Bahn")
-        - Strecke prüfen: get_transport_disruptions(filter_text="Bern")
+    Call this tool for disruption questions. Check status before interpreting alerts.
+    An error means verification unavailable, never "no disruptions".
+    filter_text: place or line terms; ANY term matches, accent-insensitive.
+    This is textual matching, NOT verified route coverage: zero matches never
+    proves that a route has no disruptions. Check each alert's affected area and
+    validity. Planned or unknown validity is not confirmed active.
+    language: DE, FR, IT or EN; fallback text is labelled with its language.
+    max_results: 1-50 (default 15). Explain truncation and snapshot age.
     """
-    error = _check_api("SIRI-SX Störungsmeldungen", "SIRI_SX_API_KEY")
+    error = _check_api("SIRI-SX", "SIRI_SX_API_KEY")
     if error:
-        return error
+        return '{"status":"not_configured","message":"Disruption verification unavailable."}'
 
     client = _get_ext_client()
     return await get_disruptions(
