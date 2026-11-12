@@ -11,13 +11,14 @@
             {origin_ref}
             <Name><Text>{origin_name}</Text></Name>
           </PlaceRef>
-          <DepArrTime>{dep_time}</DepArrTime>
+          {origin_time}
         </Origin>
         <Destination>
           <PlaceRef>
             {destination_ref}
             <Name><Text>{destination_name}</Text></Name>
           </PlaceRef>
+          {destination_time}
         </Destination>
         <Params>
           <NumberOfResults>{limit}</NumberOfResults>
