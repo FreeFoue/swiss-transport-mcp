@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .request_times import request_time
 from .local_times import place_zones, enrich_event, enrich_leg, enrich_trip
 
 # OJP 2.0 XML namespaces
@@ -112,13 +113,14 @@ def build_stop_event_request(
     dep_arr_time: str | None = None,
     limit: int = 10,
     event_type: str = "departure",
+    time_zone: str = "Europe/Zurich",
 ) -> str:
     template = _load_template("stop_event_request.xml")
     return template.format(
         timestamp=_now_iso(),
         place_ref=_build_place_ref(stop_ref),
         stop_name=_escape_xml(stop_name or stop_ref),
-        dep_arr_time=dep_arr_time or _now_iso(),
+        dep_arr_time=request_time(dep_arr_time, time_zone),
         limit=limit,
         event_type=event_type,
     )
@@ -131,7 +133,13 @@ def build_trip_request(
     destination_name: str = "",
     dep_time: str | None = None,
     limit: int = 5,
+    time_zone: str = "Europe/Zurich",
+    time_type: str = "departure",
 ) -> str:
+    if time_type not in ("departure", "arrival"):
+        raise ValueError("time_type must be departure or arrival")
+    if time_type == "arrival" and dep_time is None:
+        raise ValueError("An arrival search requires an explicit time")
     template = _load_template("trip_request.xml")
     return template.format(
         timestamp=_now_iso(),
@@ -139,7 +147,8 @@ def build_trip_request(
         origin_name=_escape_xml(origin_name or origin_ref),
         destination_ref=_build_place_ref(destination_ref),
         destination_name=_escape_xml(destination_name or destination_ref),
-        dep_time=dep_time or _now_iso(),
+        origin_time=(f"<DepArrTime>{request_time(dep_time, time_zone)}</DepArrTime>" if time_type == "departure" else ""),
+        destination_time=(f"<DepArrTime>{request_time(dep_time, time_zone)}</DepArrTime>" if time_type == "arrival" else ""),
         limit=limit,
     )
 
